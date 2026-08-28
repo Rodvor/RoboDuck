@@ -17,7 +17,6 @@ from env.microduck_env import MicroDuckEnv
 
 def make_env():
     def _init():
-        # Monitor is needed on every worker for ep_rew_mean and ep_len_mean.
         return Monitor(MicroDuckEnv())
 
     return _init
@@ -34,13 +33,23 @@ def create_vector_env(number_of_envs):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train a MicroDuck standing policy using parallel environments."
+        description="Continue training an existing MicroDuck PPO checkpoint."
+    )
+    parser.add_argument(
+        "--model",
+        default="microduck_stand_parallel",
+        help="Checkpoint to continue from (default: microduck_stand_parallel)",
+    )
+    parser.add_argument(
+        "--output",
+        default="microduck_stand_parallel_continued",
+        help="Continued checkpoint name (default: microduck_stand_parallel_continued)",
     )
     parser.add_argument(
         "--timesteps",
         type=int,
         default=1_000_000,
-        help="Total training timesteps across all workers (default: 1000000)",
+        help="Additional training timesteps (default: 1000000)",
     )
     parser.add_argument(
         "--n-envs",
@@ -62,11 +71,6 @@ def main():
         default=1024,
         help="Rollout steps collected by each worker (default: 1024)",
     )
-    parser.add_argument(
-        "--output",
-        default="microduck_stand_parallel",
-        help="Output checkpoint name (default: microduck_stand_parallel)",
-    )
     args = parser.parse_args()
 
     if args.timesteps <= 0:
@@ -81,32 +85,38 @@ def main():
     env = create_vector_env(args.n_envs)
 
     try:
-        print(
-            f"Training with {args.n_envs} environments, "
-            f"{args.n_steps} steps per environment, "
-            f"{rollout_size} samples per PPO rollout, and "
-            f"{args.torch_threads} PyTorch thread(s)."
-        )
+        checkpoint = PPO.load(args.model, device="cpu")
+        checkpoint_size = checkpoint.observation_space.shape[0]
+        environment_size = env.observation_space.shape[0]
+        if checkpoint_size != environment_size:
+            raise ValueError(
+                f"Checkpoint has {checkpoint_size} observations but the successful "
+                f"standing environment uses {environment_size}. Train a fresh model "
+                f"with 'python3 train_stand.py' before continuing it."
+            )
 
-        model = PPO(
-            "MlpPolicy",
-            env,
-            policy_kwargs={"log_std_init": -1.0},
-            learning_rate=3e-4,
+        model = PPO.load(
+            args.model,
+            env=env,
+            device="cpu",
             n_steps=args.n_steps,
             batch_size=512,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.0,
-            verbose=1,
-            device="cpu",
         )
 
-        model.learn(total_timesteps=args.timesteps)
+        print(
+            f"Continuing {args.model} for {args.timesteps:,} additional timesteps "
+            f"with {args.n_envs} parallel environments and "
+            f"{rollout_size} samples per PPO rollout using "
+            f"{args.torch_threads} PyTorch thread(s)..."
+        )
+
+        model.learn(
+            total_timesteps=args.timesteps,
+            reset_num_timesteps=False,
+        )
+
         model.save(args.output)
-        print(f"Model saved as {args.output}.zip")
+        print(f"Continued model saved as {args.output}.zip")
     finally:
         env.close()
 

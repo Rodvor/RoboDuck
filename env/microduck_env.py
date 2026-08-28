@@ -9,9 +9,9 @@ import numpy as np
 
 class MicroDuckEnv(gym.Env):
 
-    # Stable pose authored with the robot model (actuator order). The policy
-    # commands small offsets around this pose instead of the actuator's very
-    # broad +/-10 rad electrical control range.
+    # Physically authored standing pose in actuator order. The policy controls
+    # small offsets around this pose instead of the raw +/-10 radian actuator
+    # range, which made early exploration violently unstable.
     STAND_POSE = np.array([
         0.0, -0.08726646, -0.457924, -0.004940, 0.452984,
         0.34906585, 0.34906585, 0.0, 0.0,
@@ -60,32 +60,58 @@ class MicroDuckEnv(gym.Env):
             "right_ankle",
         ]
 
-        # Resolve model metadata once. Name lookup is surprisingly expensive
-        # when repeated for every observation and reward calculation.
+        # Resolve all joint addresses once. Looking names up inside every step
+        # is unnecessary Python overhead because model addresses are constant.
         joint_ids = np.asarray([
             mujoco.mj_name2id(
-                self.model, mujoco.mjtObj.mjOBJ_JOINT, name
+                self.model,
+                mujoco.mjtObj.mjOBJ_JOINT,
+                name,
             )
             for name in self.joint_names
         ])
-        self._joint_qpos_adr = self.model.jnt_qposadr[joint_ids].copy()
-        self._joint_dof_adr = self.model.jnt_dofadr[joint_ids].copy()
-        self._head_qpos_adr = self._joint_qpos_adr[5:9]
-        self._head_dof_adr = self._joint_dof_adr[5:9]
+        self.joint_qpos_addresses = self.model.jnt_qposadr[joint_ids]
+        self.joint_dof_addresses = self.model.jnt_dofadr[joint_ids]
+        self.head_qpos_addresses = self.joint_qpos_addresses[5:9]
+        self.head_dof_addresses = self.joint_dof_addresses[5:9]
 
-        self._left_foot_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "left_foot_collision"
+        # The jaw_soft body is near the center of the complete head assembly.
+        self.head_body_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            "jaw_soft",
         )
-        self._right_foot_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "right_foot_collision"
+        self.trunk_body_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_BODY,
+            "trunk_base",
         )
-        self._floor_id = mujoco.mj_name2id(
-            self.model, mujoco.mjtObj.mjOBJ_GEOM, "floor"
+        self.foot_site_ids = np.asarray([
+            mujoco.mj_name2id(
+                self.model,
+                mujoco.mjtObj.mjOBJ_SITE,
+                name,
+            )
+            for name in ("left_foot", "right_foot")
+        ])
+        self.left_foot_geom_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "left_foot_collision",
         )
-
-        self._joint_lower = self.model.jnt_range[joint_ids, 0].copy()
-        self._joint_upper = self.model.jnt_range[joint_ids, 1].copy()
-        self._last_action = np.zeros(14, dtype=np.float64)
+        self.right_foot_geom_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "right_foot_collision",
+        )
+        self.floor_geom_id = mujoco.mj_name2id(
+            self.model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            "floor",
+        )
+        self.joint_lower = self.model.jnt_range[joint_ids, 0].copy()
+        self.joint_upper = self.model.jnt_range[joint_ids, 1].copy()
+        self.last_action = np.zeros(14, dtype=np.float64)
 
         # ==========================================
         # ACTION SPACE
@@ -101,10 +127,10 @@ class MicroDuckEnv(gym.Env):
         # ==========================================
         # OBSERVATION
         #
-        # quaternion       4
-        # angular velocity 3
-        # linear velocity  3
-        # joint positions 14
+        # quaternion        4
+        # angular velocity  3
+        # linear velocity   3
+        # joint offsets    14
         # joint velocities 14
         #
         # TOTAL = 38
@@ -147,24 +173,20 @@ class MicroDuckEnv(gym.Env):
         self.data.qpos[1] = 0.0
         self.data.qpos[2] = 0.120
 
-        # ==========================================
-        # SMALL RANDOM BODY TILT
-        # ==========================================
+        # Horizontal reference used by the standing-position reward.
+        self.initial_xy = self.data.qpos[:2].copy()
 
         roll = self.np_random.uniform(-0.03, 0.03)
         pitch = self.np_random.uniform(-0.03, 0.03)
         yaw = self.np_random.uniform(-0.02, 0.02)
 
-        quat = np.array([
+        quaternion = np.array([
             1.0,
             roll / 2.0,
             pitch / 2.0,
-            yaw / 2.0
+            yaw / 2.0,
         ])
-
-        quat = quat / np.linalg.norm(quat)
-
-        self.data.qpos[3:7] = quat
+        self.data.qpos[3:7] = quaternion / np.linalg.norm(quaternion)
 
         # ==========================================
         # INITIAL JOINT POSE
@@ -173,20 +195,14 @@ class MicroDuckEnv(gym.Env):
         # exact good standing pose.
         # ==========================================
 
-        # ==========================================
-        # RANDOMIZED INITIAL POSE
-        # ==========================================
-
-        # Start near a physically meaningful stance. A small perturbation still
-        # teaches recovery without making every early rollout an instant fall.
         standing_pose = self.STAND_POSE + self.np_random.uniform(
             low=-0.025,
             high=0.025,
-            size=14
+            size=14,
         )
-        self.data.qpos[self._joint_qpos_adr] = standing_pose
+        self.data.qpos[self.joint_qpos_addresses] = standing_pose
         self.data.ctrl[:] = self.STAND_POSE
-        self._last_action.fill(0.0)
+        self.last_action.fill(0.0)
 
         # ==========================================
         # ZERO VELOCITY
@@ -215,23 +231,26 @@ class MicroDuckEnv(gym.Env):
 
         self.step_count += 1
 
-        action = np.asarray(action, dtype=np.float32)
+        action = np.asarray(
+            action,
+            dtype=np.float32
+        )
 
         # ==========================================
-        # NORMALIZED ACTION -> ACTUATOR CONTROL
+        # NORMALIZED ACTION -> STANDING-POSE OFFSET
         # ==========================================
 
-        # A normalized action is a local adjustment around the standing pose.
-        # Mapping it to the raw +/-10 rad actuator range made random exploration
-        # violently saturate every servo and prevented PPO from seeing useful
-        # standing experience.
-        np.clip(action, -1.0, 1.0, out=self._last_action)
-        np.multiply(self._last_action, self.ACTION_SCALE, out=self.data.ctrl)
+        np.clip(action, -1.0, 1.0, out=self.last_action)
+        np.multiply(
+            self.last_action,
+            self.ACTION_SCALE,
+            out=self.data.ctrl,
+        )
         self.data.ctrl += self.STAND_POSE
         np.clip(
             self.data.ctrl,
-            self._joint_lower,
-            self._joint_upper,
+            self.joint_lower,
+            self.joint_upper,
             out=self.data.ctrl,
         )
 
@@ -239,9 +258,11 @@ class MicroDuckEnv(gym.Env):
         # PHYSICS
         # ==========================================
 
-        # MuJoCo performs the loop in native code, avoiding five Python/C
-        # boundary crossings per environment step.
-        mujoco.mj_step(self.model, self.data, nstep=self.frame_skip)
+        mujoco.mj_step(
+            self.model,
+            self.data,
+            nstep=self.frame_skip,
+        )
 
         # ==========================================
         # OBSERVATION
@@ -280,11 +301,7 @@ class MicroDuckEnv(gym.Env):
 
     def _get_observation(self):
 
-        # ==========================================
-        # BODY LINEAR VELOCITY
-        # ==========================================
-
-        linear_velocity = self.data.qvel[0:3]
+        linear_velocity = self.data.qvel[:3]
 
         # ==========================================
         # BODY ORIENTATION
@@ -303,14 +320,17 @@ class MicroDuckEnv(gym.Env):
         # ==========================================
 
         joint_positions = (
-            self.data.qpos[self._joint_qpos_adr] - self.STAND_POSE
+            self.data.qpos[self.joint_qpos_addresses]
+            - self.STAND_POSE
         )
 
         # ==========================================
         # JOINT VELOCITIES
         # ==========================================
 
-        joint_velocities = self.data.qvel[self._joint_dof_adr]
+        joint_velocities = self.data.qvel[
+            self.joint_dof_addresses
+        ]
 
         # ==========================================
         # COMBINE
@@ -321,10 +341,22 @@ class MicroDuckEnv(gym.Env):
             angular_velocity,
             linear_velocity,
             joint_positions,
-            joint_velocities
+            joint_velocities,
         ], dtype=np.float32)
 
         return observation
+
+    def _get_com_support_error(self):
+
+        center_of_mass_xy = self.data.subtree_com[
+            self.trunk_body_id, :2
+        ]
+        feet_midpoint_xy = np.mean(
+            self.data.site_xpos[self.foot_site_ids, :2],
+            axis=0,
+        )
+
+        return center_of_mass_xy - feet_midpoint_xy
 
     # ==================================================
     # REWARD
@@ -333,127 +365,98 @@ class MicroDuckEnv(gym.Env):
     def _get_reward(self):
 
         # ==========================================
-        # 1. TORSO UPRIGHTNESS
+        # TORSO UPRIGHTNESS
         # ==========================================
 
         quat = self.data.qpos[3:7]
-
-        # Z component of the local up vector for a MuJoCo wxyz quaternion.
-        up_z = 1.0 - 2.0 * (quat[1] * quat[1] + quat[2] * quat[2])
-
-        # 1.0 = perfectly upright
-        # 0.0 = sideways
-        # -1.0 = upside down
-        upright = np.clip(up_z, -1.0, 1.0)
-
-        upright_reward = max(0.0, upright)
+        up_z = 1.0 - 2.0 * (
+            quat[1] * quat[1]
+            + quat[2] * quat[2]
+        )
+        upright_reward = max(
+            0.0,
+            float(np.clip(up_z, -1.0, 1.0)),
+        )
 
         # ==========================================
-        # 2. BODY HEIGHT
+        # BODY HEIGHT
         # ==========================================
 
-        height = self.data.qpos[2]
-
-        target_height = 0.115
-
-        height_error = height - target_height
-
+        height_error = self.data.qpos[2] - 0.115
         height_reward = np.exp(
             -150.0 * height_error ** 2
         )
 
         # ==========================================
-        # 3. FOOT CONTACT
+        # BOTH FEET ON THE FLOOR
         # ==========================================
 
         left_contact = False
         right_contact = False
 
-        for i in range(self.data.ncon):
+        for index in range(self.data.ncon):
+            contact = self.data.contact[index]
+            geom1 = contact.geom1
+            geom2 = contact.geom2
 
-            contact = self.data.contact[i]
-
-            g1 = contact.geom1
-            g2 = contact.geom2
-
-            # Left foot touching floor
             if (
-                    (g1 == self._left_foot_id and g2 == self._floor_id)
-                    or
-                    (g2 == self._left_foot_id and g1 == self._floor_id)
+                (geom1 == self.left_foot_geom_id and geom2 == self.floor_geom_id)
+                or
+                (geom2 == self.left_foot_geom_id and geom1 == self.floor_geom_id)
             ):
                 left_contact = True
 
-            # Right foot touching floor
             if (
-                    (g1 == self._right_foot_id and g2 == self._floor_id)
-                    or
-                    (g2 == self._right_foot_id and g1 == self._floor_id)
+                (geom1 == self.right_foot_geom_id and geom2 == self.floor_geom_id)
+                or
+                (geom2 == self.right_foot_geom_id and geom1 == self.floor_geom_id)
             ):
                 right_contact = True
 
-        foot_contact_reward = (
-                float(left_contact)
-                + float(right_contact)
-        )
+        foot_contact_reward = float(left_contact) + float(right_contact)
 
         # ==========================================
-        # 4. BODY ANGULAR VELOCITY
+        # MOTION PENALTIES
         # ==========================================
-
-        angular_velocity = self.data.qvel[3:6]
 
         angular_velocity_penalty = (
-                0.10 *
-                np.sum(angular_velocity ** 2)
+            0.10 * np.sum(self.data.qvel[3:6] ** 2)
         )
-
-        # ==========================================
-        # 5. JOINT VELOCITY
-        # ==========================================
-
         joint_velocity_penalty = (
-                0.0005 *
-                np.sum(self.data.qvel[6:] ** 2)
+            0.0005 * np.sum(self.data.qvel[6:] ** 2)
         )
 
         # ==========================================
-        # 6. HEAD/NECK STABILITY
+        # HEAD AND WHOLE-BODY STANDING POSE
         # ==========================================
 
         head_joint_positions = (
-            self.data.qpos[self._head_qpos_adr] - self.STAND_POSE[5:9]
+            self.data.qpos[self.head_qpos_addresses]
+            - self.STAND_POSE[5:9]
         )
-        head_joint_velocities = self.data.qvel[self._head_dof_adr]
-
-        # A Gaussian gives the policy a strong, smooth incentive to keep all
-        # four head joints near the neutral standing pose.
+        head_joint_velocities = self.data.qvel[
+            self.head_dof_addresses
+        ]
         head_pose_reward = np.exp(
             -8.0 * np.sum(head_joint_positions ** 2)
         )
-
         head_velocity_penalty = (
             0.01 * np.sum(head_joint_velocities ** 2)
         )
 
-        # Upright + height alone permits awkward, splayed-leg solutions. This
-        # broad Gaussian favors the authored whole-body stance while still
-        # leaving enough freedom for active balance corrections.
         joint_pose_error = (
-            self.data.qpos[self._joint_qpos_adr] - self.STAND_POSE
+            self.data.qpos[self.joint_qpos_addresses]
+            - self.STAND_POSE
         )
-        stand_pose_reward = np.exp(-2.0 * np.sum(joint_pose_error ** 2))
+        stand_pose_reward = np.exp(
+            -2.0 * np.sum(joint_pose_error ** 2)
+        )
+
+        # Penalize policy offsets rather than the non-zero standing targets.
+        control_penalty = 0.02 * np.sum(self.last_action ** 2)
 
         # ==========================================
-        # 7. CONTROL EFFORT
-        # ==========================================
-
-        # Penalize policy offsets, not absolute servo targets: the authored
-        # standing pose itself contains non-zero commands.
-        control_penalty = 0.02 * np.sum(self._last_action ** 2)
-
-        # ==========================================
-        # 8. ALIVE BONUS
+        # ALIVE BONUS
         # ==========================================
 
         alive_bonus = 1.0
@@ -463,23 +466,21 @@ class MicroDuckEnv(gym.Env):
         # ==========================================
 
         reward = (
-                8.0 * upright_reward
-                + 2.0 * height_reward
-                + 2.0 * foot_contact_reward
-                + 3.0 * head_pose_reward
-                + 2.0 * stand_pose_reward
-                + alive_bonus
-                - angular_velocity_penalty
-                - joint_velocity_penalty
-                - head_velocity_penalty
-                - control_penalty
+            8.0 * upright_reward
+            + 2.0 * height_reward
+            + 2.0 * foot_contact_reward
+            + 3.0 * head_pose_reward
+            + 2.0 * stand_pose_reward
+            + alive_bonus
+            - angular_velocity_penalty
+            - joint_velocity_penalty
+            - head_velocity_penalty
+            - control_penalty
         )
 
-        # Keep critic targets in a numerically comfortable range. PPO
-        # normalizes advantages, so this preserves the reward trade-offs while
-        # avoiding value losses in the tens of thousands.
+        # Keep critic targets numerically comfortable without changing the
+        # relative reward trade-offs.
         return float(0.05 * reward)
-
 
     # ==================================================
     # FALL DETECTION
@@ -493,10 +494,11 @@ class MicroDuckEnv(gym.Env):
             return True
 
         quat = self.data.qpos[3:7]
+        up_z = 1.0 - 2.0 * (
+            quat[1] * quat[1]
+            + quat[2] * quat[2]
+        )
 
-        up_z = 1.0 - 2.0 * (quat[1] * quat[1] + quat[2] * quat[2])
-
-        # Terminate if torso tilts more than about 60 degrees.
         if up_z < 0.35:
             return True
 
