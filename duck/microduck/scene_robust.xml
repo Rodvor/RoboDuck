@@ -1,0 +1,14 @@
+<mujoco model="microduck robust terrain">
+    <include file="robot_allcollisions.xml" />
+
+    <asset>
+        <hfield name="training_terrain" nrow="33" ncol="129"
+                size="3 1 0.03 0.03" />
+    </asset>
+
+    <worldbody>
+        <geom name="training_terrain_collision" type="hfield"
+              hfield="training_terrain" pos="0 0 -0.015"
+              friction="1.0 0.005 0.0001" />
+    </worldbody>
+</mujoco>

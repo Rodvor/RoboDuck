@@ -10,6 +10,8 @@ import numpy as np
 
 class MicroDuckEnv(gym.Env):
 
+    MODEL_XML = "robot_allcollisions.xml"
+
     # Physically authored standing pose in actuator order. The policy controls
     # small offsets around this pose instead of the raw +/-10 radian actuator
     # range, which made early exploration violently unstable.
@@ -39,7 +41,7 @@ class MicroDuckEnv(gym.Env):
             project_root
             / "duck"
             / "microduck"
-            / "robot_allcollisions.xml"
+            / self.MODEL_XML
         )
         self.model = mujoco.MjModel.from_xml_path(str(model_path))
 
