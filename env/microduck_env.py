@@ -1,5 +1,6 @@
 import gymnasium as gym
 from gymnasium import spaces
+from pathlib import Path
 
 import mujoco
 import mujoco.viewer
@@ -33,9 +34,14 @@ class MicroDuckEnv(gym.Env):
         # LOAD OFFICIAL MICRODUCK
         # ==========================================
 
-        self.model = mujoco.MjModel.from_xml_path(
-            "duck/microduck/robot_allcollisions.xml"
+        project_root = Path(__file__).resolve().parents[1]
+        model_path = (
+            project_root
+            / "duck"
+            / "microduck"
+            / "robot_allcollisions.xml"
         )
+        self.model = mujoco.MjModel.from_xml_path(str(model_path))
 
         self.data = mujoco.MjData(self.model)
 

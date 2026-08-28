@@ -27,14 +27,14 @@ class MicroDuckWalkEnv(MicroDuckEnv):
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
             g1, g2 = contact.geom1, contact.geom2
-            if g1 == self._floor_id:
+            if g1 == self.floor_geom_id:
                 other = g2
-            elif g2 == self._floor_id:
+            elif g2 == self.floor_geom_id:
                 other = g1
             else:
                 continue
-            contacts[0] |= other == self._left_foot_id
-            contacts[1] |= other == self._right_foot_id
+            contacts[0] |= other == self.left_foot_geom_id
+            contacts[1] |= other == self.right_foot_geom_id
         return contacts
 
     def _get_reward(self):
@@ -58,13 +58,13 @@ class MicroDuckWalkEnv(MicroDuckEnv):
 
         height_reward = np.exp(-150.0 * height_error ** 2)
         joint_pose_error = (
-            self.data.qpos[self._joint_qpos_adr] - self.STAND_POSE
+            self.data.qpos[self.joint_qpos_addresses] - self.STAND_POSE
         )
         loose_pose_reward = np.exp(-0.75 * np.sum(joint_pose_error ** 2))
 
-        action_rate = np.sum((self._last_action - self._previous_action) ** 2)
-        effort = np.sum(self._last_action ** 2)
-        joint_speed = np.sum(self.data.qvel[self._joint_dof_adr] ** 2)
+        action_rate = np.sum((self.last_action - self._previous_action) ** 2)
+        effort = np.sum(self.last_action ** 2)
+        joint_speed = np.sum(self.data.qvel[self.joint_dof_addresses] ** 2)
 
         contacts = self._foot_contacts()
         step_dt = self.frame_skip * self.model.opt.timestep
@@ -76,8 +76,8 @@ class MicroDuckWalkEnv(MicroDuckEnv):
             touchdown * np.exp(-((self._air_time - 0.18) / 0.09) ** 2)
         )
         foot_z = np.array([
-            self.data.geom_xpos[self._left_foot_id, 2],
-            self.data.geom_xpos[self._right_foot_id, 2],
+            self.data.geom_xpos[self.left_foot_geom_id, 2],
+            self.data.geom_xpos[self.right_foot_geom_id, 2],
         ])
         single_support = contacts[0] ^ contacts[1]
         swing_index = 1 if contacts[0] else 0
@@ -106,5 +106,5 @@ class MicroDuckWalkEnv(MicroDuckEnv):
             - 0.0002 * joint_speed
         )
 
-        self._previous_action[:] = self._last_action
+        self._previous_action[:] = self.last_action
         return float(0.10 * reward)
