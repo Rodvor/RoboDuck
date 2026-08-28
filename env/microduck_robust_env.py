@@ -11,15 +11,27 @@ class MicroDuckRobustEnv(MicroDuckWalkEnv):
     """Commanded walking with a staged robustness curriculum."""
 
     MODEL_XML = "scene_robust.xml"
+    RECOVERY_GRACE_STEPS = 250
+    SEVERE_FALL_GRACE_STEPS = 100
 
-    def __init__(self, render_mode=None, curriculum_horizon=312_500, evaluation=False):
+    def __init__(
+        self,
+        render_mode=None,
+        curriculum_horizon=312_500,
+        curriculum_start_fraction=0.0,
+        evaluation=False,
+    ):
         super().__init__(render_mode=render_mode)
         self.curriculum_horizon = max(1, int(curriculum_horizon))
         self.evaluation = evaluation
-        self.curriculum_step = 0
+        start_fraction = float(np.clip(curriculum_start_fraction, 0.0, 1.0))
+        self.curriculum_step = int(start_fraction * self.curriculum_horizon)
         self.target_speed = 0.0
         self._push_steps_remaining = 0
+        self._push_force = np.zeros(3, dtype=np.float64)
         self._next_push_step = 10**9
+        self._fall_steps = 0
+        self._previous_recovery_potential = 0.0
 
         self.observation_space = spaces.Box(
             low=-np.inf,
@@ -145,21 +157,44 @@ class MicroDuckRobustEnv(MicroDuckWalkEnv):
             self.model.body_mass[self.trunk_body_id] *= trunk_scale
 
         self._push_steps_remaining = 0
+        self._push_force.fill(0.0)
         if progress >= 0.20:
-            self._next_push_step = self.np_random.integers(150, 350)
+            self._next_push_step = int(self.np_random.integers(100, 300))
         else:
             self._next_push_step = 10**9
 
     def reset(self, seed=None, options=None):
-        # Configure model-level randomization before reset/forward dynamics.
         if not hasattr(self, "terrain_hfield_id"):
             return super().reset(seed=seed, options=options)
-        self._configure_episode()
+        # Let Gym establish the requested seed before sampling any curriculum
+        # randomization, then update the model and run forward dynamics again.
         observation, info = super().reset(seed=seed, options=options)
+        self._configure_episode()
+        progress = 1.0 if self.evaluation else self.curriculum_progress
+
         # Terrain height at the spawn is centered around zero; slightly more
         # clearance avoids initial penetration on the largest bumps.
-        self.data.qpos[2] += 0.008 * self.curriculum_progress
+        self.data.qpos[2] += 0.008 * progress
+
+        # Occasionally begin moderately off balance. These are catch/recovery
+        # states, not fully prone get-up states, and become harder gradually.
+        if progress >= 0.25 and self.np_random.random() < 0.30 * progress:
+            maximum_tilt = 0.08 + 0.40 * progress
+            roll = self.np_random.uniform(-maximum_tilt, maximum_tilt)
+            pitch = self.np_random.uniform(-maximum_tilt, maximum_tilt)
+            yaw = self.np_random.uniform(-0.04, 0.04)
+            self.data.qpos[3:7] = self._euler_to_quaternion(roll, pitch, yaw)
+            maximum_angular_speed = 0.25 + 1.25 * progress
+            self.data.qvel[3:5] = self.np_random.uniform(
+                -maximum_angular_speed,
+                maximum_angular_speed,
+                size=2,
+            )
+
+        self._fall_steps = 0
+        self.data.xfrc_applied[self.trunk_body_id] = 0.0
         mujoco.mj_forward(self.model, self.data)
+        self._previous_recovery_potential = self._recovery_potential()
         observation = self._get_observation()
         info.update({
             "target_speed": self.target_speed,
@@ -167,25 +202,62 @@ class MicroDuckRobustEnv(MicroDuckWalkEnv):
         })
         return observation, info
 
+    @staticmethod
+    def _euler_to_quaternion(roll, pitch, yaw):
+        cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
+        cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
+        cy, sy = math.cos(yaw / 2.0), math.sin(yaw / 2.0)
+        return np.array([
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ])
+
     def _apply_push_if_due(self):
+        self.data.xfrc_applied[self.trunk_body_id] = 0.0
         progress = 1.0 if self.evaluation else self.curriculum_progress
-        if self.step_count != self._next_push_step:
-            return
-        maximum_push = 0.03 + 0.12 * progress
-        self.data.qvel[0] += self.np_random.uniform(-maximum_push, maximum_push)
-        self.data.qvel[1] += self.np_random.uniform(-maximum_push, maximum_push)
-        self._next_push_step += int(self.np_random.integers(150, 350))
+        if self._push_steps_remaining <= 0 and self.step_count >= self._next_push_step:
+            angle = self.np_random.uniform(-math.pi, math.pi)
+            maximum_force = 0.40 + 1.60 * progress
+            magnitude = self.np_random.uniform(0.40, 1.0) * maximum_force
+            self._push_force[:] = (
+                magnitude * math.cos(angle),
+                magnitude * math.sin(angle),
+                0.0,
+            )
+            self._push_steps_remaining = int(self.np_random.integers(5, 16))
+            self._next_push_step += int(self.np_random.integers(100, 300))
+
+        if self._push_steps_remaining > 0:
+            self.data.xfrc_applied[self.trunk_body_id, :3] = self._push_force
+            self._push_steps_remaining -= 1
 
     def step(self, action):
         self._apply_push_if_due()
         result = super().step(action)
         self.curriculum_step += 1
         observation, reward, terminated, truncated, info = result
+        if terminated:
+            reward -= 2.0
         info.update({
             "target_speed": self.target_speed,
             "curriculum_progress": self.curriculum_progress,
+            "recovery_steps": self._fall_steps,
+            "push_force": float(np.linalg.norm(self._push_force))
+            if self._push_steps_remaining > 0 else 0.0,
         })
         return observation, reward, terminated, truncated, info
+
+    def _recovery_potential(self):
+        quat = self.data.qpos[3:7]
+        up_z = 1.0 - 2.0 * (quat[1] ** 2 + quat[2] ** 2)
+        height = self.data.qpos[2]
+        return 2.0 * np.clip(up_z, -1.0, 1.0) + 8.0 * np.clip(
+            height,
+            0.0,
+            0.12,
+        )
 
     def _get_reward(self):
         quat = self.data.qpos[3:7]
@@ -214,12 +286,26 @@ class MicroDuckRobustEnv(MicroDuckWalkEnv):
         self._previous_action[:] = self.last_action
         height_reward = np.exp(-150.0 * (self.data.qpos[2] - 0.115) ** 2)
 
+        recovery_potential = self._recovery_potential()
+        recovery_progress = np.clip(
+            recovery_potential - self._previous_recovery_potential,
+            -0.20,
+            0.20,
+        )
+        self._previous_recovery_potential = recovery_potential
+        posture_deficit = (
+            max(0.0, 0.60 - up_z)
+            + 8.0 * max(0.0, 0.075 - self.data.qpos[2])
+        )
+
         reward = (
             6.0 * command_reward
             + 12.0 * progress_reward
             + 2.0 * touchdown_reward
             + 1.0 * upright
             + 0.25 * height_reward
+            + 8.0 * recovery_progress
+            - 2.0 * posture_deficit
             - 1.5 * vy ** 2
             - 0.20 * yaw_rate ** 2
             - 0.04 * action_rate
@@ -227,3 +313,30 @@ class MicroDuckRobustEnv(MicroDuckWalkEnv):
         )
         return float(0.10 * reward)
 
+    def _is_fallen(self):
+        """Give the policy time to catch itself before ending the episode."""
+        progress = 1.0 if self.evaluation else self.curriculum_progress
+        if progress < 0.20:
+            # Preserve the easier walking objective before recovery states are
+            # introduced to a model transferred from the walking checkpoint.
+            return super()._is_fallen()
+
+        height = self.data.qpos[2]
+        quat = self.data.qpos[3:7]
+        up_z = 1.0 - 2.0 * (quat[1] ** 2 + quat[2] ** 2)
+
+        needs_recovery = height < 0.075 or up_z < 0.45
+        if needs_recovery:
+            self._fall_steps += 1
+        else:
+            # Require a sustained recovery, while forgiving brief threshold
+            # crossings rather than resetting all progress immediately.
+            self._fall_steps = max(0, self._fall_steps - 5)
+
+        severe_fall = height < 0.025 or up_z < -0.50
+        grace_steps = (
+            self.SEVERE_FALL_GRACE_STEPS
+            if severe_fall
+            else self.RECOVERY_GRACE_STEPS
+        )
+        return self._fall_steps >= grace_steps
