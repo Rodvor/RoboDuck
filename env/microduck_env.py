@@ -399,14 +399,16 @@ class MicroDuckEnv(gym.Env):
 
         height = self.data.qpos[2]
 
-        if height < 0.20:
-
+        # MicroDuck standing height is about 0.10 m.
+        # Only consider it fallen if it drops substantially.
+        if height < 0.055:
             return True
 
         quat = self.data.qpos[3:7]
 
-        if quat[0] ** 2 < 0.30:
-
+        # Quaternion w component.
+        # Near 1.0 = upright.
+        if quat[0] ** 2 < 0.50:
             return True
 
         return False

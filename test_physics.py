@@ -29,6 +29,10 @@ for i in range(500):
 
     if terminated or truncated:
         print("DUCK FELL")
-        break
 
+        print("height:", env.data.qpos[2])
+        print("quat:", env.data.qpos[3:7])
+        print("quat[0]^2:", env.data.qpos[3] ** 2)
+
+        break
 env.close()
